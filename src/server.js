@@ -51,12 +51,50 @@ app.get('/api/health', (req, res) => {
 const PORT = Number(process.env.PORT) || 5003;
 const MONGODB_URI = process.env.MONGODB_URI;
 
+function redactMongoUri(uri) {
+  return uri.replace(/\/\/([^:]+):([^@]+)@/, '//$1:<redacted>@');
+}
+
+function logMongoConnectionError(error) {
+  const hostname = (() => {
+    try {
+      return new URL(MONGODB_URI).hostname;
+    } catch {
+      return 'unknown-host';
+    }
+  })();
+
+  console.error('Failed to connect to MongoDB.');
+  console.error(`MongoDB host: ${hostname}`);
+  console.error(`MongoDB URI detected: ${redactMongoUri(MONGODB_URI)}`);
+
+  if (error?.name) {
+    console.error(`MongoDB error name: ${error.name}`);
+  }
+
+  if (error?.message) {
+    console.error(`MongoDB error message: ${error.message}`);
+  }
+
+  console.error(
+    'Checklist: verify Render environment variables, Atlas network access, Atlas database user credentials, and that the connection string uses the correct cluster.'
+  );
+
+  if (error?.name === 'MongooseServerSelectionError') {
+    console.error(
+      'Atlas access hint: if Render is not on Atlas allowlist, either allow all IPs temporarily (0.0.0.0/0) for testing or add the required Render egress addresses.'
+    );
+  }
+}
+
 async function startServer() {
   if (!MONGODB_URI) {
     throw new Error('MONGODB_URI is required in the backend environment');
   }
 
-  await mongoose.connect(MONGODB_URI);
+  await mongoose.connect(MONGODB_URI, {
+    serverSelectionTimeoutMS: 15000
+  });
   console.log('Connected to MongoDB');
 
   server.listen(PORT, () => {
@@ -65,6 +103,9 @@ async function startServer() {
 }
 
 startServer().catch((error) => {
+  if (MONGODB_URI) {
+    logMongoConnectionError(error);
+  }
   console.error('Failed to start server:', error);
   process.exit(1);
 });
