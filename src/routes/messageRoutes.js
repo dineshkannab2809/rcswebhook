@@ -4,6 +4,31 @@ const RbmMessage = require('../services/rbmMessageModel');
 
 const router = express.Router();
 
+const normalizeConversationId = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  const trimmed = value.toString().trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.startsWith('+')) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith('91') && trimmed.length === 12) {
+    return `+${trimmed}`;
+  }
+
+  if (/^\d{10}$/.test(trimmed)) {
+    return `+91${trimmed}`;
+  }
+
+  return trimmed;
+};
+
 const normalizeMessage = (messageDoc) => {
   const message = messageDoc.toObject ? messageDoc.toObject() : messageDoc;
   const timestamp = message.receivedAt || new Date().toISOString();
@@ -51,13 +76,15 @@ const decodeWebhookPayload = (body) => {
 };
 
 const extractConversationId = (body, decodedPayload) =>
-  decodedPayload?.senderPhoneNumber ||
-  decodedPayload?.from ||
-  decodedPayload?.phoneNumber ||
-  body?.from ||
-  body?.conversationId ||
-  body?.senderPhoneNumber ||
-  null;
+  normalizeConversationId(
+    decodedPayload?.senderPhoneNumber ||
+      decodedPayload?.from ||
+      decodedPayload?.phoneNumber ||
+      body?.from ||
+      body?.conversationId ||
+      body?.senderPhoneNumber ||
+      null
+  );
 
 const extractMessageText = (body, decodedPayload) =>
   decodedPayload?.text ||
@@ -65,6 +92,31 @@ const extractMessageText = (body, decodedPayload) =>
   body?.text ||
   body?.message?.text ||
   '';
+
+const extractEventType = (body, decodedPayload) =>
+  decodedPayload?.eventType ||
+  body?.eventType ||
+  null;
+
+const extractMessageId = (body, decodedPayload) =>
+  decodedPayload?.messageId ||
+  body?.messageId ||
+  null;
+
+const deliveryFromEventType = (eventType) => {
+  switch (eventType) {
+    case 'DELIVERED':
+      return 'delivered';
+    case 'READ':
+      return 'read';
+    case 'TTL_EXPIRATION_REVOKED':
+      return 'expired';
+    case 'TTL_EXPIRATION_REVOKE_FAILED':
+      return 'revoke_failed';
+    default:
+      return null;
+  }
+};
 
 // POST /api/messages/send
 router.post('/send', async (req, res) => {
@@ -102,8 +154,8 @@ router.post('/send', async (req, res) => {
         templateCode: templateCode || null
       },
       direction: 'outgoing',
-      conversationId: result.recipient,
-      recipient: result.recipient,
+      conversationId: normalizeConversationId(result.recipient),
+      recipient: normalizeConversationId(result.recipient),
       mode: result.mode,
       text: message || '',
       templateCode: templateCode || null,
@@ -148,16 +200,60 @@ router.get('/history', async (req, res) => {
   }
 });
 
-// POST /api/messages/webhook/rbm
-router.post('/webhook/rbm', async (req, res) => {
+const handleIncomingWebhook = async (req, res) => {
   try {
     const decodedPayload = decodeWebhookPayload(req.body);
     const conversationId = extractConversationId(req.body, decodedPayload);
     const text = extractMessageText(req.body, decodedPayload);
+    const eventType = extractEventType(req.body, decodedPayload);
+    const delivery = deliveryFromEventType(eventType);
+    const webhookMessageId = extractMessageId(req.body, decodedPayload);
 
     if (!conversationId) {
       return res.status(400).json({
         error: 'Unable to determine conversationId from webhook payload'
+      });
+    }
+
+    if (delivery) {
+      if (!webhookMessageId) {
+        return res.status(400).json({
+          error: `Webhook event ${eventType} is missing messageId`
+        });
+      }
+
+      const updatedMessage = await RbmMessage.findOneAndUpdate(
+        {
+          conversationId,
+          messageId: webhookMessageId,
+          direction: 'outgoing'
+        },
+        {
+          $set: {
+            delivery,
+            raw: req.body,
+            decoded: decodedPayload
+          }
+        },
+        {
+          new: true,
+          sort: { receivedAt: -1 }
+        }
+      );
+
+      if (!updatedMessage) {
+        return res.status(404).json({
+          error: `No outgoing message found for messageId ${webhookMessageId}`
+        });
+      }
+
+      const normalizedMessage = normalizeMessage(updatedMessage);
+      emitConversationMessage(req, normalizedMessage.conversationId, normalizedMessage);
+
+      return res.status(200).json({
+        success: true,
+        eventType,
+        savedMessage: normalizedMessage
       });
     }
 
@@ -166,11 +262,12 @@ router.post('/webhook/rbm', async (req, res) => {
       decoded: decodedPayload,
       direction: 'incoming',
       conversationId,
-      sender:
+      sender: normalizeConversationId(
         decodedPayload?.senderPhoneNumber ||
-        decodedPayload?.from ||
-        req.body?.from ||
-        null,
+          decodedPayload?.from ||
+          req.body?.from ||
+          null
+      ),
       recipient:
         decodedPayload?.agentId ||
         decodedPayload?.to ||
@@ -194,7 +291,11 @@ router.post('/webhook/rbm', async (req, res) => {
       message: error.message
     });
   }
-});
+};
+
+// Supports both /api/messages/webhook/rbm and /webhook/rbm
+router.post('/webhook/rbm', handleIncomingWebhook);
+router.post('/rbm', handleIncomingWebhook);
 
 // GET /api/messages/health
 router.get('/health', (req, res) => {
