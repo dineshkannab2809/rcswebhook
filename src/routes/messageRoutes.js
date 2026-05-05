@@ -1,5 +1,6 @@
 const express = require('express');
 const dotgoService = require('../services/dotgoService');
+const templateService = require('../services/templateService');
 const RbmMessage = require('../services/rbmMessageModel');
 const Contact = require('../services/contactModel');
 const MessageTemplate = require('../services/templateModel');
@@ -75,7 +76,16 @@ const normalizeTemplate = (templateDoc) => {
     code: template.code,
     title: template.title || template.code,
     content: template.content || '',
-    ttl: template.ttl || '10s'
+    ttl: template.ttl || '10s',
+    type: template.type || 'text_message',
+    templateUseCase: template.templateUseCase || 'Transactional',
+    suggestions: template.suggestions || [],
+    remoteTemplateId: template.remoteTemplateId || null,
+    status: template.status || 'pending',
+    statusMessage: template.statusMessage || '',
+    webhookEvent: template.webhookEvent || '',
+    statusUpdatedAt: template.statusUpdatedAt || null,
+    webhookEvents: template.webhookEvents || []
   };
 };
 
@@ -164,6 +174,32 @@ const ensureContact = async (phone, name) => {
     }
   );
 };
+
+const extractTemplateWebhookStatus = (body) =>
+  body?.statusDetails?.status ||
+  body?.status ||
+  body?.templateStatus ||
+  body?.approvalStatus ||
+  'pending';
+
+const extractTemplateWebhookMessage = (body) =>
+  body?.statusDetails?.message ||
+  body?.message ||
+  body?.status_message ||
+  '';
+
+const extractTemplateWebhookCode = (body) =>
+  body?.templateCode ||
+  body?.name ||
+  body?.templateName ||
+  body?.statusDetails?.name ||
+  null;
+
+const extractTemplateWebhookRemoteId = (body) =>
+  body?.templateId ||
+  body?.id ||
+  body?.remoteTemplateId ||
+  null;
 
 // POST /api/messages/send
 router.post('/send', async (req, res) => {
@@ -372,6 +408,9 @@ router.post('/templates', async (req, res) => {
     const title = (req.body.title || '').toString().trim();
     const content = (req.body.content || '').toString().trim();
     const ttl = (req.body.ttl || '10s').toString().trim();
+    const type = (req.body.type || 'text_message').toString().trim();
+    const templateUseCase = (req.body.templateUseCase || 'Transactional').toString().trim();
+    const suggestions = Array.isArray(req.body.suggestions) ? req.body.suggestions : [];
 
     if (!code) {
       return res.status(400).json({
@@ -379,13 +418,36 @@ router.post('/templates', async (req, res) => {
       });
     }
 
+    if (!content) {
+      return res.status(400).json({
+        error: 'Template content is required'
+      });
+    }
+
+    const remoteTemplate = await templateService.createTemplate({
+      code,
+      content,
+      type,
+      templateUseCase,
+      suggestions
+    });
+
     const template = await MessageTemplate.findOneAndUpdate(
       { code },
       {
         $set: {
           title: title || code,
           content,
-          ttl
+          ttl,
+          type,
+          templateUseCase,
+          suggestions,
+          remoteTemplateId: remoteTemplate.remoteTemplateId,
+          status: 'submitted',
+          statusMessage: 'Template created in Dotgo and awaiting webhook updates.',
+          webhookEvent: 'template_created',
+          statusUpdatedAt: new Date(),
+          raw: remoteTemplate.raw
         }
       },
       {
@@ -396,12 +458,80 @@ router.post('/templates', async (req, res) => {
 
     return res.status(201).json(normalizeTemplate(template));
   } catch (error) {
+    console.error('Template creation failed:', error.message);
+    if (error.response) {
+      console.error('Template API response status:', error.response.status);
+      console.error('Template API response data:', error.response.data);
+    }
+
     return res.status(500).json({
       error: 'Failed to save template',
-      message: error.message
+      message: error.response?.data?.message || error.message
     });
   }
 });
+
+// POST /api/messages/templates/webhook/status
+const handleTemplateStatusWebhook = async (req, res) => {
+  try {
+    const code = extractTemplateWebhookCode(req.body);
+    const remoteTemplateId = extractTemplateWebhookRemoteId(req.body);
+    const status = extractTemplateWebhookStatus(req.body);
+    const statusMessage = extractTemplateWebhookMessage(req.body);
+    const webhookEvent = req.body?.event || req.body?.eventType || 'template_status';
+
+    if (!code && !remoteTemplateId) {
+      return res.status(400).json({
+        error: 'Unable to determine template identity from webhook payload'
+      });
+    }
+
+    const filter = code
+      ? { code }
+      : { remoteTemplateId };
+
+    const template = await MessageTemplate.findOneAndUpdate(
+      filter,
+      {
+        $set: {
+          status,
+          statusMessage,
+          webhookEvent,
+          statusUpdatedAt: new Date(),
+          raw: req.body
+        },
+        $push: {
+          webhookEvents: {
+            receivedAt: new Date(),
+            event: webhookEvent,
+            status,
+            statusMessage,
+            payload: req.body
+          }
+        }
+      },
+      {
+        new: true
+      }
+    );
+
+    if (!template) {
+      return res.status(404).json({
+        error: 'No template found for webhook payload'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      template: normalizeTemplate(template)
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: 'Failed to process template webhook',
+      message: error.message
+    });
+  }
+};
 
 // GET /api/messages/history?conversationId=...
 router.get('/history', async (req, res) => {
@@ -521,6 +651,8 @@ const handleIncomingWebhook = async (req, res) => {
 // Supports both /api/messages/webhook/rbm and /webhook/rbm
 router.post('/webhook/rbm', handleIncomingWebhook);
 router.post('/rbm', handleIncomingWebhook);
+router.post('/templates/webhook/status', handleTemplateStatusWebhook);
+router.post('/webhook/templates/status', handleTemplateStatusWebhook);
 
 // GET /api/messages/health
 router.get('/health', (req, res) => {
