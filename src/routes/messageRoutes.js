@@ -1,6 +1,8 @@
 const express = require('express');
 const dotgoService = require('../services/dotgoService');
 const RbmMessage = require('../services/rbmMessageModel');
+const Contact = require('../services/contactModel');
+const MessageTemplate = require('../services/templateModel');
 
 const router = express.Router();
 
@@ -52,6 +54,28 @@ const normalizeMessage = (messageDoc) => {
     messageName: message.messageName || null,
     recipient: message.recipient || null,
     sender: message.sender || null
+  };
+};
+
+const normalizeContact = (contactDoc) => {
+  const contact = contactDoc.toObject ? contactDoc.toObject() : contactDoc;
+
+  return {
+    id: contact._id?.toString?.() || contact.id,
+    phone: contact.phone,
+    name: contact.name || contact.phone
+  };
+};
+
+const normalizeTemplate = (templateDoc) => {
+  const template = templateDoc.toObject ? templateDoc.toObject() : templateDoc;
+
+  return {
+    id: template._id?.toString?.() || template.id,
+    code: template.code,
+    title: template.title || template.code,
+    content: template.content || '',
+    ttl: template.ttl || '10s'
   };
 };
 
@@ -118,21 +142,60 @@ const deliveryFromEventType = (eventType) => {
   }
 };
 
+const ensureContact = async (phone, name) => {
+  const normalizedPhone = normalizeConversationId(phone);
+  if (!normalizedPhone) {
+    return null;
+  }
+
+  const safeName = (name || '').toString().trim();
+
+  return Contact.findOneAndUpdate(
+    { phone: normalizedPhone },
+    {
+      $setOnInsert: {
+        phone: normalizedPhone
+      },
+      ...(safeName ? { $set: { name: safeName } } : {})
+    },
+    {
+      new: true,
+      upsert: true
+    }
+  );
+};
+
 // POST /api/messages/send
 router.post('/send', async (req, res) => {
   try {
     const { recipient, message, templateCode, botId } = req.body;
     const overrideBot = botId || req.query.botId;
+    const normalizedRecipient = normalizeConversationId(recipient);
 
-    if (!recipient || (!message && !templateCode)) {
+    if (!normalizedRecipient || (!message && !templateCode)) {
       return res.status(400).json({
         error: 'Missing required fields: recipient and either message or templateCode'
       });
     }
 
+    let selectedTemplate = null;
+    if (templateCode) {
+      selectedTemplate = await MessageTemplate.findOne({ code: templateCode });
+
+      if (!selectedTemplate) {
+        return res.status(400).json({
+          error: `Template ${templateCode} was not found`
+        });
+      }
+    }
+
     const result = await dotgoService.sendMessage(
-      recipient,
-      { message, templateCode },
+      normalizedRecipient,
+      {
+        message,
+        templateCode,
+        ttl: selectedTemplate?.ttl
+      },
       overrideBot
     );
 
@@ -165,6 +228,7 @@ router.post('/send', async (req, res) => {
     });
 
     const normalizedMessage = normalizeMessage(savedMessage);
+    await ensureContact(normalizedMessage.conversationId);
     emitConversationMessage(req, normalizedMessage.conversationId, normalizedMessage);
 
     return res.status(200).json({
@@ -174,6 +238,166 @@ router.post('/send', async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+// GET /api/messages/conversations
+router.get('/conversations', async (req, res) => {
+  try {
+    const [contacts, conversationSummaries] = await Promise.all([
+      Contact.find().sort({ updatedAt: -1, createdAt: -1 }),
+      RbmMessage.aggregate([
+        {
+          $sort: {
+            receivedAt: -1
+          }
+        },
+        {
+          $group: {
+            _id: '$conversationId',
+            latestMessage: { $first: '$$ROOT' },
+            unread: {
+              $sum: {
+                $cond: [{ $eq: ['$direction', 'incoming'] }, 1, 0]
+              }
+            }
+          }
+        }
+      ])
+    ]);
+
+    const contactByPhone = new Map(
+      contacts.map((contact) => [contact.phone, normalizeContact(contact)])
+    );
+
+    const conversationPhones = new Set();
+    const conversations = conversationSummaries
+      .filter((summary) => summary._id)
+      .map((summary) => {
+        const conversationId = summary._id;
+        conversationPhones.add(conversationId);
+        const contact = contactByPhone.get(conversationId);
+        const latestMessage = normalizeMessage(summary.latestMessage);
+
+        return {
+          recipient: conversationId,
+          name: contact?.name || conversationId,
+          preview: latestMessage.text || 'No messages yet',
+          unread: summary.unread || 0,
+          status: latestMessage.direction === 'incoming' ? 'Waiting' : 'Ongoing',
+          updatedAt: latestMessage.timestamp
+        };
+      });
+
+    contacts.forEach((contact) => {
+      if (!conversationPhones.has(contact.phone)) {
+        conversations.push({
+          recipient: contact.phone,
+          name: contact.name || contact.phone,
+          preview: 'No messages yet',
+          unread: 0,
+          status: 'Waiting',
+          updatedAt: contact.updatedAt || contact.createdAt || new Date().toISOString()
+        });
+      }
+    });
+
+    conversations.sort(
+      (left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
+    );
+
+    return res.json(conversations);
+  } catch (error) {
+    return res.status(500).json({
+      error: 'Failed to fetch conversations',
+      message: error.message
+    });
+  }
+});
+
+// GET /api/messages/contacts
+router.get('/contacts', async (req, res) => {
+  try {
+    const contacts = await Contact.find().sort({ updatedAt: -1, createdAt: -1 });
+    return res.json(contacts.map(normalizeContact));
+  } catch (error) {
+    return res.status(500).json({
+      error: 'Failed to fetch contacts',
+      message: error.message
+    });
+  }
+});
+
+// POST /api/messages/contacts
+router.post('/contacts', async (req, res) => {
+  try {
+    const phone = normalizeConversationId(req.body.phone);
+    const name = (req.body.name || '').toString().trim();
+
+    if (!phone) {
+      return res.status(400).json({
+        error: 'Phone is required'
+      });
+    }
+
+    const contact = await ensureContact(phone, name);
+    return res.status(201).json(normalizeContact(contact));
+  } catch (error) {
+    return res.status(500).json({
+      error: 'Failed to create contact',
+      message: error.message
+    });
+  }
+});
+
+// GET /api/messages/templates
+router.get('/templates', async (req, res) => {
+  try {
+    const templates = await MessageTemplate.find().sort({ updatedAt: -1, createdAt: -1 });
+    return res.json(templates.map(normalizeTemplate));
+  } catch (error) {
+    return res.status(500).json({
+      error: 'Failed to fetch templates',
+      message: error.message
+    });
+  }
+});
+
+// POST /api/messages/templates
+router.post('/templates', async (req, res) => {
+  try {
+    const code = (req.body.code || '').toString().trim();
+    const title = (req.body.title || '').toString().trim();
+    const content = (req.body.content || '').toString().trim();
+    const ttl = (req.body.ttl || '10s').toString().trim();
+
+    if (!code) {
+      return res.status(400).json({
+        error: 'Template code is required'
+      });
+    }
+
+    const template = await MessageTemplate.findOneAndUpdate(
+      { code },
+      {
+        $set: {
+          title: title || code,
+          content,
+          ttl
+        }
+      },
+      {
+        new: true,
+        upsert: true
+      }
+    );
+
+    return res.status(201).json(normalizeTemplate(template));
+  } catch (error) {
+    return res.status(500).json({
+      error: 'Failed to save template',
       message: error.message
     });
   }
@@ -247,8 +471,8 @@ const handleIncomingWebhook = async (req, res) => {
         });
       }
 
-      const normalizedMessage = normalizeMessage(updatedMessage);
-      emitConversationMessage(req, normalizedMessage.conversationId, normalizedMessage);
+    const normalizedMessage = normalizeMessage(updatedMessage);
+    emitConversationMessage(req, normalizedMessage.conversationId, normalizedMessage);
 
       return res.status(200).json({
         success: true,
@@ -278,6 +502,7 @@ const handleIncomingWebhook = async (req, res) => {
     });
 
     const normalizedMessage = normalizeMessage(savedMessage);
+    await ensureContact(normalizedMessage.conversationId);
     emitConversationMessage(req, normalizedMessage.conversationId, normalizedMessage);
 
     return res.status(200).json({
