@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const templateSchema = new mongoose.Schema(
   {
     code: { type: String, required: true, unique: true },
+    remoteName: { type: String, default: '' },
     title: { type: String, default: '' },
     content: { type: String, default: '' },
     ttl: { type: String, default: '10s' },

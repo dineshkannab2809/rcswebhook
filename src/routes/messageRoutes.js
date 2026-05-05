@@ -74,6 +74,7 @@ const normalizeTemplate = (templateDoc) => {
   return {
     id: template._id?.toString?.() || template.id,
     code: template.code,
+    remoteName: template.remoteName || template.code,
     title: template.title || template.code,
     content: template.content || '',
     ttl: template.ttl || '10s',
@@ -442,6 +443,7 @@ router.post('/templates', async (req, res) => {
           type,
           templateUseCase,
           suggestions,
+          remoteName: remoteTemplate.remoteName,
           remoteTemplateId: remoteTemplate.remoteTemplateId,
           status: 'submitted',
           statusMessage: 'Template created in Dotgo and awaiting webhook updates.',

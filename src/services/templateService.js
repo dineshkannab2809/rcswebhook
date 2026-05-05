@@ -73,11 +73,12 @@ class TemplateService {
       throw new Error('DOTGO_TEMPLATE_BOT_ID is missing');
     }
 
+    const remoteName = this.buildRemoteTemplateName(template.code, template.title);
     const accessToken = await this.getAccessToken();
     const endpoint = `${this.apiRoot}/directory/secure/api/v1/bots/${encodeURIComponent(this.botId)}/templates`;
 
     const richTemplateData = {
-      name: template.code,
+      name: remoteName,
       type: template.type || 'text_message',
       templateUseCase: template.templateUseCase || 'Transactional',
       textMessageContent: template.content,
@@ -98,13 +99,32 @@ class TemplateService {
     );
 
     return {
+      remoteName,
       remoteTemplateId:
         response?.data?.id ||
         response?.data?.templateId ||
         response?.data?.name ||
-        template.code,
+        remoteName,
       raw: response.data
     };
+  }
+
+  buildRemoteTemplateName(code, title) {
+    const source = `${code || ''} ${title || ''}`.trim();
+    const alphaNumericOnly = source.replace(/[^a-zA-Z0-9]/g, '');
+    let candidate = alphaNumericOnly.slice(0, 20);
+
+    if (!/[a-zA-Z]/.test(candidate)) {
+      candidate = `tpl${candidate}`.slice(0, 20);
+    }
+
+    if (!candidate) {
+      throw new Error(
+        'Template name is invalid. Use a code or title with at least one alphabet and keep it reasonably short.'
+      );
+    }
+
+    return candidate;
   }
 }
 
