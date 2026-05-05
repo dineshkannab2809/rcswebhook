@@ -182,6 +182,7 @@ class DotgoService {
       console.log('Message sent successfully:', response.data);
       return {
         success: true,
+        recipient: formattedRecipient,
         messageId: this.extractMessageId(response.data),
         messageName: response.data.name || null,
         sendTime: response.data.sendTime || null,
