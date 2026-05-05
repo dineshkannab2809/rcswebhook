@@ -7,14 +7,19 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js"
   },
-  "keywords": ["rcs", "messaging"],
+  "keywords": [
+    "rcs",
+    "messaging"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
+    "axios": "^1.6.2",
     "cors": "^2.8.5",
     "dotenv": "^16.0.3",
-    "axios": "^1.6.2"
+    "express": "^4.18.2",
+    "mongodb": "^7.2.0",
+    "mongoose": "^9.6.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
